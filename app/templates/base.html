@@ -11,6 +11,8 @@
     <h1>🛠 {{ title }}</h1>
     <span class="hint">封锁 → 列 Pod → 按 UID 驱逐 → 复核下线</span>
     <span class="spacer"></span>
+    <a class="button" href="/">节点排空</a>
+    <a class="button" href="/nodeport">NodePort 本地后端</a>
     {% if simulator_url %}<a class="button" href="{{ simulator_url }}" target="_blank" rel="noreferrer">打开演练控制台</a>{% endif %}
   </header>
   <main>

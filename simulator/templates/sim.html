@@ -74,6 +74,23 @@
     </section>
 
     <section class="panel">
+      <h2>EndpointSlice（NodePort 演练）</h2>
+      <div class="row" style="margin-bottom:10px">
+        <button onclick="act('/api/sim/slices/expire', {})">令旧版本过期（410）</button>
+        <button id="watch-toggle" onclick="toggleWatch()">断开订阅</button>
+        <span class="hint" id="watch-hint"></span>
+      </div>
+      <table>
+        <thead><tr><th>Slice</th><th>Service / 端口</th><th>后端 IP</th><th>节点</th><th>端点状态</th><th>操作</th></tr></thead>
+        <tbody id="slices"></tbody>
+      </table>
+      <p class="hint">
+        端点可切换就绪 / 仍可服务 / 终止中；也可删除整个 Slice。
+        “令旧版本过期”后再“断开 / 恢复订阅”，值班台必须用完整列表重新同步，已删除的后端随之消失。
+      </p>
+    </section>
+
+    <section class="panel">
       <h2>最近事件</h2>
       <div id="log"></div>
     </section>
@@ -144,6 +161,63 @@ async function load() {
 
   document.getElementById('log').innerHTML = state.events.map(e =>
     `<div><span class="mono muted">${e.at}</span> · ${e.message}</div>`).join('') || '<div class="muted">暂无事件</div>';
+
+  renderSlices(state);
+  renderWatch(state.watch);
+}
+
+function flag(label, on, tone) { return badge(label, on ? tone : 'neutral'); }
+
+function renderSlices(state) {
+  const rows = [];
+  for (const s of state.slices) {
+    for (const e of s.endpoints) {
+      const id = `${s.namespace}/${s.name}/${e.address}`;
+      rows.push(`<tr>
+        <td class="mono">${s.namespace}/${s.name}<div class="hint mono">rv ${s.resourceVersion}</div></td>
+        <td class="mono">${s.service} · ${s.portName}/${s.port}</td>
+        <td class="mono">${e.address}<div class="hint mono">${e.pod || '—'}</div></td>
+        <td class="mono">${e.node}</td>
+        <td class="row">${flag('就绪', e.ready, 'ok')}${flag('服务中', e.serving, 'info')}${flag('终止中', e.terminating, 'warn')}</td>
+        <td><div class="row">
+          <button onclick="setEndpoint('${id}', {ready: ${!e.ready}})">${e.ready ? '置为未就绪' : '置为就绪'}</button>
+          <button onclick="setEndpoint('${id}', {serving: ${!e.serving}})">${e.serving ? '置为不服务' : '置为服务中'}</button>
+          <button onclick="setEndpoint('${id}', {terminating: ${!e.terminating}})">${e.terminating ? '取消终止' : '置为终止中'}</button>
+          <button onclick="act('/api/sim/endpoints/${id}/delete', {})">删除端点</button>
+        </div></td>
+      </tr>`);
+    }
+    rows.push(`<tr>
+      <td class="mono">${s.namespace}/${s.name}</td>
+      <td class="mono">${s.service} 整片 Slice</td>
+      <td class="hint">${s.endpoints.length} 个端点</td>
+      <td></td><td></td>
+      <td><button onclick="if (confirm('删除整个 Slice ${s.namespace}/${s.name}？')) act('/api/sim/slices/${s.namespace}/${s.name}/delete', {})">删除 Slice</button></td>
+    </tr>`);
+  }
+  document.getElementById('slices').innerHTML = rows.join('') ||
+    '<tr><td colspan="6" class="muted">没有 EndpointSlice</td></tr>';
+}
+
+function renderWatch(watch) {
+  const btn = document.getElementById('watch-toggle');
+  const hint = document.getElementById('watch-hint');
+  if (!btn) return;
+  btn.textContent = watch.enabled ? '断开订阅' : '恢复订阅';
+  btn.className = watch.enabled ? 'danger' : 'primary';
+  hint.textContent = `${watch.enabled ? '订阅通道开启' : '订阅通道已断开'} · rv ${watch.resourceVersion}` +
+    (watch.expiredBefore ? ` · 早于 rv ${watch.expiredBefore} 的版本返回 410` : '');
+  btn.dataset.enabled = watch.enabled ? '1' : '0';
+}
+
+async function setEndpoint(id, body) {
+  await act('/api/sim/endpoints/' + id, body);
+}
+
+async function toggleWatch() {
+  const btn = document.getElementById('watch-toggle');
+  const enabled = btn.dataset.enabled === '1';
+  await act('/api/sim/watch', {enabled: !enabled});
 }
 
 async function updateBudget(id) {

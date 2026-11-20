@@ -23,6 +23,8 @@ from pathlib import Path
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
+from kubernetes.watch.watch import iter_resp_lines
+from urllib3.exceptions import HTTPError as HttpTransportError
 
 from .models import NodeInfo, Pod, PodBudget
 
@@ -31,12 +33,65 @@ class KubeError(RuntimeError):
     pass
 
 
+class ResourceExpired(KubeError):
+    """The watch's resourceVersion is older than the server still retains."""
+
+
+class WatchUnavailable(KubeError):
+    """A watch could not be established (for example, a rehearsed outage)."""
+
+
 class EvictionBlocked(Exception):
     """The API server refused the eviction because of a PodDisruptionBudget."""
 
 
 class EvictionConflict(Exception):
     """The pod object changed or vanished between listing and evicting."""
+
+
+class WatchStream:
+    """A live watch response, parsed one JSON event at a time.
+
+    The Kubernetes generated client's ``Watch`` helper silently retries once
+    after a 410 and hides whether a watch connection was actually accepted.
+    The NodePort console needs both facts: 410 must trigger a full list (so
+    deleted slices disappear), and a broken connection must be visible as
+    "待同步".  Reading the response ourselves keeps that control.
+    """
+
+    def __init__(self, response):
+        self.response = response
+        self._closed = False
+
+    def __iter__(self):
+        try:
+            for line in iter_resp_lines(self.response):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict):
+                    yield event
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        response = self.response
+        self.response = None
+        try:
+            response.close()
+        except Exception:
+            pass
+        try:
+            response.release_conn()
+        except Exception:
+            pass
 
 
 def _controller_kind(pod: client.V1Pod) -> str:
@@ -138,6 +193,7 @@ class KubeClient:
         self._api = api
         self.core = client.CoreV1Api(api)
         self.policy = client.PolicyV1Api(api)
+        self.discovery = client.DiscoveryV1Api(api)
 
     # -- construction ------------------------------------------------------
     @classmethod
@@ -207,10 +263,15 @@ class KubeClient:
             condition.type == "Ready" and condition.status == "True"
             for condition in (node.status.conditions or [])
         ) if node.status else False
+        addresses: list[str] = []
+        for address in (node.status.addresses or []) if node.status else []:
+            if address.type in ("InternalIP", "ExternalIP") and address.address:
+                addresses.append(address.address)
         return NodeInfo(
             name=node.metadata.name,
             unschedulable=bool(node.spec.unschedulable),
             ready=ready,
+            addresses=addresses,
         )
 
     @staticmethod
@@ -347,3 +408,98 @@ class KubeClient:
                 f"驱逐 {pod.namespace}/{pod.name} 失败: {exc.status} "
                 f"{_status_message(exc)}"
             ) from exc
+
+    # -- NodePort entry points ---------------------------------------------
+    #
+    # The console only understands the strict subset of Services where the
+    # node's own kube-proxy is the thing answering on the NodePort: an IPv4
+    # TCP service with ``externalTrafficPolicy: Local``.  With ``Cluster`` a
+    # node may forward to a backend on another node, so "which backends are
+    # reachable from *this* node" has no per-node answer; anything else is
+    # rejected rather than guessed at.
+    def get_service(self, namespace: str, name: str) -> client.V1Service | None:
+        try:
+            return self.core.read_namespaced_service(name, namespace)
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise KubeError(
+                f"读取 Service {namespace}/{name} 失败: {exc.status} {_status_message(exc)}"
+            ) from exc
+        except HttpTransportError as exc:
+            raise KubeError(f"无法连接 API Server：{exc}") from exc
+
+    def list_endpoint_slices(
+        self, namespace: str, service: str, timeout: float | None = None
+    ) -> tuple[list[dict], str]:
+        """One consistent list of the slices for a service.
+
+        Returns ``(slices, resource_version)``.  Raw dictionaries are used so
+        the same shape feeds both the first render and the watch's ``UPDATE``
+        events.  ``resourceVersion`` is taken from the list itself: a watch
+        started from it is guaranteed to include every change after the
+        snapshot, so nothing is missed between list and watch.
+
+        ``timeout`` bounds the request so an unreachable API server cannot
+        stall the first page render for the client's default timeout.
+        """
+        selector = f"kubernetes.io/service-name={service}"
+        items: list[dict] = []
+        token: str | None = None
+        resource_version = ""
+        try:
+            while True:
+                page = self.discovery.list_namespaced_endpoint_slice(
+                    namespace,
+                    label_selector=selector,
+                    limit=500,
+                    _continue=token,
+                    _request_timeout=timeout,
+                )
+                items.extend(self._api.sanitize_for_serialization(item) for item in page.items or [])
+                metadata = page.metadata
+                if metadata is not None and metadata.resource_version:
+                    resource_version = str(metadata.resource_version)
+                token = metadata._continue if metadata else None
+                if not token:
+                    break
+        except ApiException as exc:
+            raise KubeError(
+                f"读取 EndpointSlice {namespace}/{service} 失败: "
+                f"{exc.status} {_status_message(exc)}"
+            ) from exc
+        except HttpTransportError as exc:
+            raise KubeError(f"无法连接 API Server：{exc}") from exc
+        return items, resource_version
+
+    def watch_endpoint_slices(
+        self, namespace: str, service: str, resource_version: str
+    ) -> WatchStream:
+        """Open a watch on the service's slices from a known resourceVersion.
+
+        ``WatchUnavailable`` means no stream was established at all (HTTP
+        error, unreachable server).  The caller marks its view stale and
+        retries.  A ``410`` that arrives *after* the stream opened is surfaced
+        by ``WatchStream``'s caller as ``ResourceExpired``.
+        """
+        selector = f"kubernetes.io/service-name={service}"
+        try:
+            response = self.discovery.list_namespaced_endpoint_slice(
+                namespace,
+                label_selector=selector,
+                resource_version=resource_version or None,
+                watch=True,
+                allow_watch_bookmarks=True,
+                _preload_content=False,
+            )
+        except ApiException as exc:
+            if exc.status == 410:
+                raise ResourceExpired(
+                    f"EndpointSlice 版本 {resource_version} 已过期"
+                ) from exc
+            raise WatchUnavailable(
+                f"订阅 EndpointSlice 失败: {exc.status} {_status_message(exc)}"
+            ) from exc
+        except HttpTransportError as exc:
+            raise WatchUnavailable(f"无法连接 API Server：{exc}") from exc
+        return WatchStream(response)

@@ -113,6 +113,7 @@ class NodeInfo:
     unschedulable: bool
     ready: bool
     pod_count: int = 0
+    addresses: list[str] = field(default_factory=list)
 
 
 @dataclass

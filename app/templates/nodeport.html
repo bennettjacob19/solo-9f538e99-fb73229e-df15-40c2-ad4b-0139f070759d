@@ -1,0 +1,220 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="row-split">
+    <h2>NodePort 本地后端排查</h2>
+    <span class="muted small">只观察，不修改集群</span>
+  </div>
+  <p class="small muted">
+    从某个节点的 NodePort 连不上服务时，填写命名空间、Service 名和 NodePort，
+    查看各节点可用的本地后端 IP 和实际端口。只支持
+    <span class="mono">externalTrafficPolicy=Local</span> 的 IPv4 TCP 入口；
+    列表与订阅均来自该 Service 的 EndpointSlice。
+  </p>
+  <form method="get" action="/nodeport" class="nodeport-form">
+    <label>命名空间
+      <input name="namespace" value="{{ namespace }}" placeholder="shop" required>
+    </label>
+    <label>Service
+      <input name="service" value="{{ service }}" placeholder="web" required>
+    </label>
+    <label>NodePort
+      <input name="port" value="{{ port }}" placeholder="30080" inputmode="numeric" required>
+    </label>
+    <button class="primary" type="submit">查看本地后端</button>
+  </form>
+</section>
+
+{% if error %}
+  <div class="alert error"><strong>无法显示：</strong>{{ error }}</div>
+{% endif %}
+
+{% if entry and payload %}
+{% set snapshot = payload.snapshot %}
+<section class="panel"
+         id="nodeport-live"
+         data-namespace="{{ entry.namespace }}"
+         data-service="{{ entry.name }}"
+         data-port="{{ entry.node_port }}"
+         data-session="{{ snapshot.session }}"
+         data-revision="{{ snapshot.revision }}">
+  <div class="row-split">
+    <h3 class="mono">{{ entry.namespace }}/{{ entry.name }} · NodePort {{ entry.node_port }}</h3>
+    <span id="sync-badge"
+          class="badge {{ 'warn' if snapshot.stale else 'ok' }}"
+          title="{{ snapshot.last_error }}">
+      {{ '待同步' if snapshot.stale else '已同步' }}
+    </span>
+  </div>
+  <p class="small muted">
+    {% if entry.port_name %}端口名 <span class="mono">{{ entry.port_name }}</span> · {% endif %}
+    Service 端口 <span class="mono">{{ entry.service_port }}</span>
+    {% if entry.target_port is not none %} · 目标端口 <span class="mono">{{ entry.target_port }}</span>{% endif %}
+    · externalTrafficPolicy={{ entry.policy }} · {{ entry.address_type }} TCP
+  </p>
+  <p class="small muted" id="sync-detail">
+    {% if snapshot.stale %}{{ snapshot.last_error or '连接已断开，正用完整列表重新同步。' }}{% else %}
+      订阅 {{ snapshot.slice_count }} 个 EndpointSlice（resourceVersion {{ snapshot.resource_version or '—' }}）。
+    {% endif %}
+  </p>
+
+  <div class="nodeport-grid" id="nodeport-cards">
+    {% for view in payload.nodes %}
+      <div class="nodeport-card">
+        <div class="row-split">
+          <span class="name mono">{{ view.name }}</span>
+          <span class="badge {{ 'ok' if view.mode == 'ready' else ('warn' if view.mode == 'fallback' else 'danger') }}">{{ view.label }}</span>
+        </div>
+        {% if view.backends %}
+          <table>
+            <thead><tr><th>本地后端 IP</th><th>实际端口</th><th>来源 Pod</th><th>状态</th></tr></thead>
+            <tbody>
+              {% for backend in view.backends %}
+                <tr>
+                  <td class="mono small">{{ backend.address }}</td>
+                  <td class="mono small">{{ backend.port if backend.port is not none else '—' }}</td>
+                  <td class="mono small">{{ backend.pod or '—' }}</td>
+                  <td class="small">
+                    {% if backend.ready %}<span class="badge ok">就绪</span>{% else %}<span class="badge warn">终止中 · 仍在服务</span>{% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <p class="small muted">{% if view.mode == 'none' %}该节点没有就绪或仍可服务的终止中后端。{% endif %}</p>
+        {% endif %}
+      </div>
+    {% else %}
+      <p class="muted">未读取到节点，无法按节点归类后端。</p>
+    {% endfor %}
+  </div>
+</section>
+
+<script>
+(function () {
+  const root = document.getElementById('nodeport-live');
+  if (!root) return;
+  const ns = root.dataset.namespace;
+  const svc = root.dataset.service;
+  const port = root.dataset.port;
+  let session = root.dataset.session;
+  let revision = parseInt(root.dataset.revision || '0', 10);
+  let busy = false;
+
+  function badge(tone, text) {
+    const el = document.createElement('span');
+    el.className = 'badge ' + tone;
+    el.textContent = text;
+    return el;
+  }
+
+  function render(data) {
+    const snap = data.snapshot;
+    session = snap.session || session;
+    revision = snap.revision;
+    root.dataset.session = session;
+    root.dataset.revision = String(revision);
+
+    const sync = document.getElementById('sync-badge');
+    sync.className = 'badge ' + (snap.stale ? 'warn' : 'ok');
+    sync.textContent = snap.stale ? '待同步' : '已同步';
+    sync.title = snap.last_error || '';
+    document.getElementById('sync-detail').textContent = snap.stale
+      ? (snap.last_error || '连接已断开，正用完整列表重新同步。')
+      : '订阅 ' + snap.slice_count + ' 个 EndpointSlice（resourceVersion ' +
+        (snap.resource_version || '—') + '）。';
+
+    const cards = document.getElementById('nodeport-cards');
+    cards.innerHTML = '';
+    for (const view of data.nodes) {
+      const card = document.createElement('div');
+      card.className = 'nodeport-card';
+      const head = document.createElement('div');
+      head.className = 'row-split';
+      const name = document.createElement('span');
+      name.className = 'name mono';
+      name.textContent = view.name;
+      head.append(name, badge(view.mode === 'ready' ? 'ok'
+        : (view.mode === 'fallback' ? 'warn' : 'danger'), view.label));
+      card.append(head);
+
+      if (view.backends.length) {
+        const table = document.createElement('table');
+        table.innerHTML = '<thead><tr><th>本地后端 IP</th><th>实际端口</th>' +
+          '<th>来源 Pod</th><th>状态</th></tr></thead>';
+        const body = document.createElement('tbody');
+        for (const backend of view.backends) {
+          const row = document.createElement('tr');
+          for (const value of [backend.address, backend.port ?? '—', backend.pod || '—']) {
+            const cell = document.createElement('td');
+            cell.className = 'mono small';
+            cell.textContent = String(value);
+            row.append(cell);
+          }
+          const stateCell = document.createElement('td');
+          stateCell.className = 'small';
+          stateCell.append(badge(backend.ready ? 'ok' : 'warn',
+            backend.ready ? '就绪' : '终止中 · 仍在服务'));
+          row.append(stateCell);
+          body.append(row);
+        }
+        table.append(body);
+        card.append(table);
+      } else {
+        const empty = document.createElement('p');
+        empty.className = 'small muted';
+        empty.textContent = view.mode === 'none'
+          ? '该节点没有就绪或仍可服务的终止中后端。' : '';
+        card.append(empty);
+      }
+      cards.append(card);
+    }
+  }
+
+  function closeSession() {
+    if (!session) return;
+    const body = new URLSearchParams({session: session});
+    const url = '/api/nodeport/close';
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(url, body);
+    } else {
+      fetch(url, {method: 'POST', body: body, keepalive: true});
+    }
+  }
+
+  async function poll() {
+    if (busy || document.hidden) return;
+    busy = true;
+    try {
+      const url = '/api/nodeport/view?namespace=' + encodeURIComponent(ns)
+        + '&service=' + encodeURIComponent(svc)
+        + '&port=' + encodeURIComponent(port)
+        + '&session=' + encodeURIComponent(session || '');
+      const res = await fetch(url, {headers: {Accept: 'application/json'}});
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.snapshot) return;
+      if (data.snapshot.revision !== revision || data.snapshot.session !== session) {
+        render(data);
+      } else {
+        session = data.snapshot.session || session;
+        revision = data.snapshot.revision;
+      }
+    } catch (err) {
+      // The next poll retries; the badge reflects the last snapshot.
+    } finally {
+      busy = false;
+    }
+  }
+
+  window.addEventListener('pagehide', closeSession);
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) poll();
+  });
+  setInterval(poll, 1500);
+  poll();
+})();
+</script>
+{% endif %}
+{% endblock %}

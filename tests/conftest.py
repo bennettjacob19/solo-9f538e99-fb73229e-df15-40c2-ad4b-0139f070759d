@@ -60,3 +60,14 @@ def sim(simulator_url):
     import httpx
 
     return httpx.Client(base_url=simulator_url, timeout=10.0)
+
+
+@pytest.fixture()
+def hub(kube):
+    from app.nodeport import NodePortHub
+
+    instance = NodePortHub(kube, session_ttl=5.0, sweep_interval=0.5)
+    try:
+        yield instance
+    finally:
+        instance.stop()

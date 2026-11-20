@@ -149,3 +149,43 @@ input[type="text"], input[type="number"], select {
   border-radius: 8px;
   padding: 7px 10px;
 }
+
+/* -- NodePort local backend view ---------------------------------------- */
+.nodeport-form {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  margin-top: 6px;
+}
+.nodeport-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.nodeport-form input {
+  font: inherit;
+  min-width: 170px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.nodeport-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  margin-top: 14px;
+}
+.nodeport-card {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.nodeport-card .name { font-weight: 600; }
+.nodeport-card table { font-size: 13px; margin-top: 8px; }
+.nodeport-card th, .nodeport-card td { padding: 6px 8px; }

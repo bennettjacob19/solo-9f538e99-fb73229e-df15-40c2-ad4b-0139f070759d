@@ -18,8 +18,14 @@ from fastapi.templating import Jinja2Templates
 
 from .config import Settings, build_client
 from .drain import DrainError, DrainManager
-from .kube import KubeError
+from .kube import KubeClient, KubeError
 from .models import DrainPhase, PodState
+from .nodeport import (
+    NodePortError,
+    NodePortHub,
+    build_node_views,
+    describe_service,
+)
 from .store import RoundStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,6 +39,8 @@ def create_app(manager: DrainManager | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.manager = manager
     app.state.startup_error = ""
+    app.state.kube = manager.kube if manager is not None else None
+    app.state.nodeport = None
 
     def get_manager(request: Request) -> DrainManager:
         if request.app.state.manager is None:
@@ -45,6 +53,20 @@ def create_app(manager: DrainManager | None = None) -> FastAPI:
                 request.app.state.startup_error = str(exc)
                 raise
         return request.app.state.manager
+
+    def get_kube(request: Request) -> KubeClient:
+        kube = request.app.state.kube
+        if kube is None:
+            kube = get_manager(request).kube
+            request.app.state.kube = kube
+        return kube
+
+    def get_hub(request: Request) -> NodePortHub:
+        hub = request.app.state.nodeport
+        if hub is None:
+            hub = NodePortHub(get_kube(request))
+            request.app.state.nodeport = hub
+        return hub
 
     def render(request: Request, template: str, **context) -> HTMLResponse:
         return templates.TemplateResponse(
@@ -172,6 +194,134 @@ def create_app(manager: DrainManager | None = None) -> FastAPI:
     @app.get("/healthz")
     def healthz():
         return {"status": "ok"}
+
+    # -- NodePort local backends ------------------------------------------
+    #
+    # Each page holds a server-side session that references the shared
+    # list+watch subscription for its service.  Two pages watching the same
+    # service share one upstream watch; closing one session leaves the other
+    # untouched.  The browser polls ``/api/nodeport/view`` and re-renders only
+    # when the subscription revision changes.
+    def _open_nodeport(request: Request, namespace: str, name: str, node_port: int):
+        kube = get_kube(request)
+        service = kube.get_service(namespace, name)
+        entry = describe_service(service, node_port)
+        hub = get_hub(request)
+        session, subscription = hub.open_session(namespace, name)
+        return entry, hub, session, subscription
+
+    def _nodeport_payload(
+        hub: NodePortHub, entry, subscription, session: str
+    ) -> tuple[dict, list]:
+        slices = subscription.slices()
+        views = build_node_views(slices, entry, hub.node_names())
+        state = subscription.state()
+        state["session"] = session
+        payload = {
+            "service": {
+                "namespace": entry.namespace,
+                "name": entry.name,
+                "node_port": entry.node_port,
+                "port_name": entry.port_name,
+                "service_port": entry.service_port,
+                "target_port": entry.target_port,
+                "policy": entry.policy,
+                "address_type": entry.address_type,
+            },
+            "snapshot": state,
+            "nodes": [view.to_dict() for view in views],
+        }
+        return payload, views
+
+    @app.get("/nodeport", response_class=HTMLResponse)
+    def nodeport_page(
+        request: Request,
+        namespace: str = "",
+        service: str = "",
+        port: str = "",
+        nodeport: str = "",
+        node_port: str = "",
+    ) -> HTMLResponse:
+        namespace = namespace.strip()
+        service = service.strip()
+        # Accept the port under either the short name used by the form or the
+        # Kubernetes spelling, so deep links from runbooks keep working.
+        port = (port or nodeport or node_port).strip()
+        context = {
+            "namespace": namespace,
+            "service": service,
+            "port": port,
+            "entry": None,
+            "payload": None,
+            "views": [],
+            "error": "",
+        }
+        if namespace and service and port:
+            try:
+                entry, hub, session, subscription = _open_nodeport(
+                    request, namespace, service, int(port)
+                )
+            except NodePortError as exc:
+                context["error"] = str(exc)
+            except (KubeError, ValueError) as exc:
+                context["error"] = str(exc)
+            else:
+                payload, views = _nodeport_payload(
+                    hub, entry, subscription, session
+                )
+                context.update(entry=entry, payload=payload, views=views)
+        elif namespace or service or port:
+            context["error"] = "请填写命名空间、Service 名和 NodePort。"
+        return render(request, "nodeport.html", **context)
+
+    @app.get("/api/nodeport/view", response_class=JSONResponse)
+    def nodeport_api(
+        request: Request,
+        namespace: str,
+        service: str,
+        port: int | None = None,
+        nodeport: int | None = None,
+        node_port: int | None = None,
+        session: str = "",
+    ):
+        node_port_value = port if port is not None else (nodeport or node_port)
+        if node_port_value is None:
+            return JSONResponse({"error": "需要 NodePort"}, status_code=422)
+        hub = get_hub(request)
+        subscription = (
+            hub.touch_session(session, namespace, service) if session else None
+        )
+        if subscription is None:
+            # The page's session expired or the process restarted; hand back
+            # a fresh one so the page keeps updating without a reload.
+            try:
+                entry, hub, session, subscription = _open_nodeport(
+                    request, namespace, service, node_port_value
+                )
+            except NodePortError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=422)
+            except (KubeError, ValueError) as exc:
+                return JSONResponse({"error": str(exc)}, status_code=503)
+            payload, _ = _nodeport_payload(hub, entry, subscription, session)
+            return payload
+        try:
+            service_obj = get_kube(request).get_service(namespace, service)
+            entry = describe_service(service_obj, node_port_value)
+        except NodePortError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+        except KubeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        payload, _ = _nodeport_payload(hub, entry, subscription, session)
+        return payload
+
+    @app.post("/api/nodeport/close", response_class=JSONResponse)
+    def nodeport_close(request: Request, session: str = Form(...)):
+        get_hub(request).close_session(session)
+        return {"closed": True}
+
+    @app.get("/api/nodeport/subscriptions", response_class=JSONResponse)
+    def nodeport_subscriptions(request: Request):
+        return {"subscriptions": get_hub(request).describe()}
 
     return app
 
