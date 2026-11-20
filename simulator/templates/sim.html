@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>演练控制台</title>
+  <style>
+    :root { --bg:#0b1120; --panel:#131c31; --line:#27344f; --text:#e6edf8; --muted:#94a6c4; --accent:#7cb0ff; --ok:#3fb950; --warn:#d29922; --danger:#f85149; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,"Segoe UI","Noto Sans SC",sans-serif; line-height:1.5; }
+    header { padding:14px 24px; border-bottom:1px solid var(--line); background:var(--panel); display:flex; gap:12px; align-items:center; }
+    header h1 { font-size:17px; margin:0; }
+    header .spacer { flex:1; }
+    main { max-width:1100px; margin:0 auto; padding:22px 24px 60px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+    h2 { font-size:15px; margin:0 0 10px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+    tr:last-child td { border-bottom:none; }
+    .mono { font-family:ui-monospace,Consolas,monospace; }
+    .muted { color:var(--muted); }
+    .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; border:1px solid var(--line); }
+    .badge.ok { color:var(--ok); border-color:#235c2e; }
+    .badge.warn { color:var(--warn); border-color:#5d4a10; }
+    .badge.danger { color:var(--danger); border-color:#6b2224; }
+    .badge.info { color:var(--accent); border-color:#2a4a78; }
+    button { font:inherit; font-size:12px; padding:5px 10px; border-radius:7px; border:1px solid var(--line); background:#1b2842; color:var(--text); cursor:pointer; }
+    button:hover { border-color:var(--accent); }
+    button.primary { background:#20457f; border-color:#2d5fa8; }
+    input { font:inherit; font-size:12px; width:80px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:7px; padding:4px 8px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .hint { font-size:12px; color:var(--muted); }
+    #log { font-size:12px; color:var(--muted); max-height:220px; overflow:auto; }
+    #log div { padding:3px 0; border-bottom:1px dashed var(--line); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🧪 本地 Kubernetes API 演练端</h1>
+    <span class="hint">仅供排空演练，不是 Kubernetes 发行版</span>
+    <span class="spacer"></span>
+    <a class="hint" id="back" href="/api/sim/state">JSON</a>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="row">
+        <button class="primary" onclick="act('/api/sim/reset', {})">恢复初始状态</button>
+        <button onclick="act('/api/sim/pods/exit-terminating', {})">让所有待退出 Pod 退出</button>
+        <span class="hint">排空操作请在值班台页面进行；这里用于调整演练条件。</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>节点</h2>
+      <table><thead><tr><th>节点</th><th>可调度</th><th>Ready</th></tr></thead><tbody id="nodes"></tbody></table>
+    </section>
+
+    <section class="panel">
+      <h2>Pod</h2>
+      <table>
+        <thead><tr><th>Pod</th><th>节点</th><th>归属</th><th>状态</th><th>同名替换 / 操作</th></tr></thead>
+        <tbody id="pods"></tbody>
+      </table>
+      <p class="hint">“同名替换”会删除当前对象并以同名新 UID 重建，用于演练驱逐与重建之间的竞争。</p>
+    </section>
+
+    <section class="panel">
+      <h2>PodDisruptionBudget</h2>
+      <table>
+        <thead><tr><th>预算</th><th>选择器</th><th>规则</th><th>允许中断</th><th>健康/期望</th><th>调整</th></tr></thead>
+        <tbody id="budgets"></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>最近事件</h2>
+      <div id="log"></div>
+    </section>
+  </main>
+
+<script>
+async function act(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {}),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    alert('操作失败：' + text);
+  }
+  await load();
+}
+
+function badge(text, tone) { return `<span class="badge ${tone}">${text}</span>`; }
+
+async function load() {
+  const state = await (await fetch('/api/sim/state')).json();
+  document.getElementById('nodes').innerHTML = state.nodes.map(n => `
+    <tr>
+      <td class="mono">${n.name}</td>
+      <td>${n.unschedulable ? badge('已封锁','warn') : badge('可调度','info')}</td>
+      <td>${n.ready ? badge('Ready','ok') : badge('NotReady','danger')}</td>
+    </tr>`).join('');
+
+  document.getElementById('pods').innerHTML = state.pods.map(p => {
+    const owner = p.static ? badge('静态 Pod','info') : (p.owner_kind || badge('独立',''));
+    const st = p.terminating ? badge('退出中','warn') : (p.healthy ? badge('运行中','ok') : badge('未就绪','danger'));
+    const id = p.namespace + '/' + p.name;
+    const readyBtn = p.terminating ? '' :
+      `<button onclick="act('/api/sim/pods/${id}/ready', {ready: ${!p.ready}})">${p.ready ? '置为未就绪' : '置为就绪'}</button>`;
+    const exitBtn = p.terminating ? `<button onclick="act('/api/sim/pods/${id}/exit', {})">令其退出</button>` : '';
+    return `<tr>
+      <td class="mono">${p.namespace}/${p.name}<div class="hint mono">UID ${p.uid.slice(0,8)}</div></td>
+      <td class="mono">${p.node}</td>
+      <td>${owner}</td>
+      <td>${st}</td>
+      <td><div class="row">${readyBtn}${exitBtn}
+        <button onclick="act('/api/sim/pods/${id}/replace', {node: prompt('重建到哪个节点？', '${p.node}') || '${p.node}'})">同名替换</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('budgets').innerHTML = state.budgets.map(b => {
+    const id = b.namespace + '/' + b.name;
+    const rule = b.minAvailable != null ? `minAvailable=${b.minAvailable}` : `maxUnavailable=${b.maxUnavailable}`;
+    return `<tr>
+      <td class="mono">${b.namespace}/${b.name}</td>
+      <td class="mono">${JSON.stringify(b.selector)}</td>
+      <td>${rule}</td>
+      <td>${b.disruptionsAllowed > 0 ? badge(b.disruptionsAllowed,'ok') : badge('0','danger')}</td>
+      <td>${b.currentHealthy}/${b.desiredHealthy}（共 ${b.expectedPods}）</td>
+      <td><div class="row">
+        <input id="budget-${id}" type="number" min="0" value="${b.minAvailable != null ? b.minAvailable : b.maxUnavailable}">
+        <select id="mode-${id}">
+          <option value="minAvailable" ${b.minAvailable != null ? 'selected' : ''}>minAvailable</option>
+          <option value="maxUnavailable" ${b.maxUnavailable != null ? 'selected' : ''}>maxUnavailable</option>
+        </select>
+        <button onclick="updateBudget('${id}')">应用</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('log').innerHTML = state.events.map(e =>
+    `<div><span class="mono muted">${e.at}</span> · ${e.message}</div>`).join('') || '<div class="muted">暂无事件</div>';
+}
+
+async function updateBudget(id) {
+  const mode = document.getElementById('mode-' + id).value;
+  const value = parseInt(document.getElementById('budget-' + id).value, 10);
+  await act('/api/sim/budgets/' + id, {[mode]: value});
+}
+
+load();
+setInterval(load, 3000);
+</script>
+</body>
+</html>

@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block content %}
+{% if error %}
+  <div class="alert error"><strong>操作失败：</strong>{{ error }}</div>
+{% endif %}
+
+<section class="panel">
+  <div class="row-split">
+    <h2 class="mono">{{ round.node }}</h2>
+    <span class="badge {{ 'ok' if round.phase.value == 'complete' else ('warn' if round.phase.value == 'interrupted' else 'info') }}">{{ round.phase.label }}</span>
+  </div>
+  <p class="small muted">
+    轮次 <span class="mono">{{ round.round_id }}</span> ·
+    创建 {{ round.created_at }} · 更新 {{ round.updated_at }}
+    {% if round.resumed_from %}<br>上次续排起点：{{ round.resumed_from }}{% endif %}
+  </p>
+
+  {% if round.busy %}
+    <div class="alert info">正在与集群交互，请稍候刷新。</div>
+  {% elif round.phase.value == 'interrupted' %}
+    <div class="alert warn">
+      <strong>本轮已中断。</strong>节点封锁和已经发生的驱逐都保留。
+      点击“继续排空”会重新读取集群后再继续，不会沿用旧快照。
+    </div>
+  {% elif round.phase.value == 'complete' %}
+    <div class="alert ok">
+      <strong>可下线。</strong>{{ round.offline_reason }}
+    </div>
+  {% elif round.offline_reason %}
+    <div class="alert warn">{{ round.offline_reason }}</div>
+  {% else %}
+    <div class="alert info">{{ round.message }}</div>
+  {% endif %}
+
+  <div class="actions">
+    {% if round.can_run %}
+      <form method="post" action="/drain/{{ round.round_id }}/run">
+        <button class="primary" type="submit">驱逐本轮 Pod</button>
+      </form>
+    {% endif %}
+    {% if round.can_interrupt %}
+      <form method="post" action="/drain/{{ round.round_id }}/interrupt" onsubmit="return confirm('中断本轮？封锁与已发生的驱逐会保留。');">
+        <button class="danger" type="submit">中断</button>
+      </form>
+    {% endif %}
+    {% if round.can_resume and not round.can_run %}
+      <form method="post" action="/drain/{{ round.round_id }}/run">
+        <button class="primary" type="submit">继续排空（重新读取集群）</button>
+      </form>
+    {% endif %}
+    <form method="post" action="/drain/{{ round.round_id }}/recheck">
+      <button class="ghost" type="submit" {% if round.busy %}disabled{% endif %}>
+        {% if round.counts.waiting %}重新检查（确认待退出 Pod 是否离开）{% else %}重新检查{% endif %}
+      </button>
+    </form>
+    <a class="button ghost" href="/">返回节点列表</a>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="grid">
+    <div class="stat"><div class="num">{{ round.counts.total }}</div><div class="cap">普通 Pod（本轮）</div></div>
+    <div class="stat {{ 'warn' if round.counts.waiting else '' }}"><div class="num">{{ round.counts.waiting }}</div><div class="cap">待退出</div></div>
+    <div class="stat ok"><div class="num">{{ round.counts.gone }}</div><div class="cap">已离开</div></div>
+    <div class="stat {{ 'danger' if round.counts.blocked else '' }}"><div class="num">{{ round.counts.blocked }}</div><div class="cap">受预算阻挡</div></div>
+    <div class="stat {{ 'warn' if round.counts.deferred else '' }}"><div class="num">{{ round.counts.deferred }}</div><div class="cap">留待续排</div></div>
+    <div class="stat"><div class="num">{{ round.counts.exempt }}</div><div class="cap">保留（DaemonSet / 静态）</div></div>
+  </div>
+  <p class="small muted" style="margin:14px 0 0">
+    可下线判定：节点当前不可调度 <strong>且</strong> 节点上已无普通 Pod。
+    {% if round.is_offline_ready %}
+      <span class="badge ok">已确认可下线</span> {{ round.offline_at }}
+    {% else %}
+      <span class="badge neutral">尚不可下线</span>
+    {% endif %}
+  </p>
+</section>
+
+{% if round.budgets %}
+<section class="panel">
+  <h3>涉及的 PodDisruptionBudget</h3>
+  <table>
+    <thead><tr><th>命名空间 / 名称</th><th>允许中断</th><th>健康 / 期望</th><th>期望 Pod 数</th></tr></thead>
+    <tbody>
+      {% for budget in round.budgets %}
+        <tr>
+          <td class="mono">{{ budget.namespace }}/{{ budget.name }}</td>
+          <td>
+            {% if budget.allowed > 0 %}
+              <span class="badge ok">{{ budget.allowed }}</span>
+            {% else %}
+              <span class="badge danger">0</span>
+            {% endif %}
+          </td>
+          <td>{{ budget.healthy }} / {{ budget.desired }}</td>
+          <td>{{ budget.expected }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="small muted" style="margin-bottom:0">
+    预算是否允许驱逐由 API Server 裁定；两节点并行排空共用同一份预算额度。
+  </p>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h3>本轮要驱逐的 Pod</h3>
+  {% if round.evictable %}
+    <table>
+      <thead>
+        <tr><th>Pod</th><th>UID</th><th>状态</th><th>说明</th><th>相关预算</th></tr>
+      </thead>
+      <tbody>
+        {% for pod in round.evictable %}
+          <tr>
+            <td class="mono">{{ pod.display_name }}</td>
+            <td class="mono small muted">{{ pod.short_uid }}</td>
+            <td><span class="badge {{ pod.state.tone }}">{{ pod.state.label }}</span></td>
+            <td class="small">
+              {{ pod.message }}
+              {% if pod.waiting_exit %}<br><span class="muted">驱逐已获准，Pod 尚未退出；退出后点“重新检查”。</span>{% endif %}
+            </td>
+            <td class="small muted">
+              {% for budget in pod.budgets %}
+                <div class="budget-line">{{ budget.namespace }}/{{ budget.name }} · {{ budget.summary }}</div>
+              {% else %}
+                <span class="muted">无</span>
+              {% endfor %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">本节点没有需要驱逐的普通 Pod。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h3>保留的 Pod（不驱逐）</h3>
+  {% if round.exempt %}
+    <table>
+      <thead><tr><th>Pod</th><th>原因</th><th>UID</th><th>说明</th></tr></thead>
+      <tbody>
+        {% for pod in round.exempt %}
+          <tr>
+            <td class="mono">{{ pod.display_name }}</td>
+            <td><span class="badge info">{{ pod.exempt_reason }}</span></td>
+            <td class="mono small muted">{{ pod.short_uid }}</td>
+            <td class="small muted">不移除、不计入“可下线”判定</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">没有 DaemonSet 或静态 Pod。</p>
+  {% endif %}
+</section>
+{% endblock %}

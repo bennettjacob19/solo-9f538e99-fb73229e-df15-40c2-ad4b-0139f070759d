@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block content %}
+{% set query_error = request.query_params.get('error') %}
+{% if query_error %}
+  <div class="alert error"><strong>操作失败：</strong>{{ query_error }}</div>
+{% endif %}
+
+<section class="panel">
+  <div class="row-split">
+    <h2>选择要检修的节点</h2>
+    <span class="muted small">节点会先被标记为不可调度，然后才列出本轮要驱逐的 Pod。</span>
+  </div>
+  {% if nodes %}
+    <div class="node-list">
+      {% for node in nodes %}
+        <div class="node-card">
+          <div class="row-split">
+            <span class="name mono">{{ node.name }}</span>
+            {% if node.unschedulable %}
+              <span class="badge warn">已封锁</span>
+            {% else %}
+              <span class="badge neutral">可调度</span>
+            {% endif %}
+          </div>
+          <div class="small muted">
+            {% if node.ready %}<span class="badge ok">Ready</span>{% else %}<span class="badge danger">NotReady</span>{% endif %}
+            当前 {{ node.pod_count }} 个 Pod
+          </div>
+          {% set ns = namespace(active=None) %}
+          {% for rnd in rounds %}
+            {% if rnd.node == node.name and rnd.phase.value != 'complete' and ns.active is none %}
+              {% set ns.active = rnd %}
+            {% endif %}
+          {% endfor %}
+          {% if ns.active %}
+            <a class="button" href="/drain/{{ ns.active.round_id }}">查看进行中的排空</a>
+          {% else %}
+            <form method="post" action="/drain" onsubmit="return confirm('确认封锁并排空 {{ node.name }}？');">
+              <input type="hidden" name="node" value="{{ node.name }}">
+              <button class="primary" type="submit">封锁并排空</button>
+            </form>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="alert warn">未读取到可排空的节点。请检查集群连接。</div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>排空轮次</h2>
+  {% if rounds %}
+    <table>
+      <thead>
+        <tr><th>节点</th><th>状态</th><th>进度</th><th>可下线</th><th>最近消息</th><th>更新时间</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for rnd in rounds %}
+          <tr>
+            <td class="mono">{{ rnd.node }}</td>
+            <td>
+              <span class="badge {{ 'ok' if rnd.phase.value == 'complete' else ('warn' if rnd.phase.value == 'interrupted' else 'info') }}">{{ rnd.phase.label }}</span>
+            </td>
+            <td class="small">
+              待驱逐 {{ rnd.counts.pending }} ·
+              待退出 {{ rnd.counts.waiting }} ·
+              已离开 {{ rnd.counts.gone }} ·
+              受预算阻挡 {{ rnd.counts.blocked }} ·
+              留待续排 {{ rnd.counts.deferred }}
+            </td>
+            <td>
+              {% if rnd.offline %}<span class="badge ok">是</span>{% else %}<span class="badge neutral">否</span>{% endif %}
+            </td>
+            <td class="small muted">{{ rnd.message }}</td>
+            <td class="small muted mono">{{ rnd.updated_at }}</td>
+            <td><a href="/drain/{{ rnd.round_id }}">详情</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">还没有排空轮次。</p>
+  {% endif %}
+</section>
+{% endblock %}

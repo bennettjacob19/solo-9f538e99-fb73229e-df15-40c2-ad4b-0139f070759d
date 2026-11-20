@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  {% if error %}
+    <div class="alert error"><strong>无法连接集群：</strong>{{ error }}</div>
+  {% endif %}
+  <h2>无法显示排空轮次</h2>
+  <p class="muted">
+    {% if error %}
+      请检查集群连接配置，然后重试。
+    {% else %}
+      轮次 <span class="mono">{{ round_id }}</span> 不存在。
+    {% endif %}
+  </p>
+  <a class="button" href="/">返回节点列表</a>
+</section>
+{% endblock %}

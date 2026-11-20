@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+python-multipart==0.0.20
+# 37.x is the first line whose generated client accepts an explicit
+# Content-Type on patch_node, which is required for the JSON merge patch used
+# to cordon a node.  Earlier 3x releases reject the keyword argument.
+kubernetes==37.0.3

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>🛠 {{ title }}</h1>
+    <span class="hint">封锁 → 列 Pod → 按 UID 驱逐 → 复核下线</span>
+    <span class="spacer"></span>
+    {% if simulator_url %}<a class="button" href="{{ simulator_url }}" target="_blank" rel="noreferrer">打开演练控制台</a>{% endif %}
+  </header>
+  <main>
+    {% if error %}
+      <div class="alert error"><strong>操作失败：</strong>{{ error }}</div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer>排空操作会直接作用于所连接的集群；请确认 kubeconfig 或服务账号权限符合预期。</footer>
+</body>
+</html>

@@ -1,0 +1,32 @@
+name: drain-rehearsal
+
+services:
+  simulator:
+    build:
+      context: .
+      dockerfile: simulator/Dockerfile
+    image: drain-rehearsal-simulator
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 9s
+      timeout: 5s
+      retries: 12
+
+  drain:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: drain-rehearsal-app
+    depends_on:
+      simulator:
+        condition: service_healthy
+    environment:
+      DRAIN_KUBE_MODE: host
+      DRAIN_KUBE_HOST: http://simulator:8080
+      DRAIN_KUBE_INSECURE: "1"
+      DRAIN_SIM_URL: http://localhost:8080
+      DRAIN_TITLE: 节点排空值班台（演练）
+    ports:
+      - "8000:8000"
